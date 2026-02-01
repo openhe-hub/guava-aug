@@ -15,7 +15,7 @@ from utils.general_utils import (
 import torchvision
 from utils.general_utils import to8b
 from omegaconf import OmegaConf
-from utils.camera_utils import generate_novel_view_poses
+from utils.camera_utils import generate_novel_view_poses, generate_novel_view_poses_with_zoom, generate_novel_view_poses_fixed
 
 
 def change_id_info(target_info,source_info):
@@ -216,6 +216,105 @@ def render_static_novel_views(meta_cfg,infer_model:Ubody_Gaussian_inferer,render
             imageio.mimwrite(os.path.join(out_videoid_dir, f'{video_id}_{ridx}_static_novel_views_video.mp4'), rendering_imgs, fps=30, quality=8)
 
 
+def render_novel_views_with_zoom(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:GaussianRenderer,dataset:TrackedData_infer,dataset_name:str,root_path:str,args):
+    """Render novel views with camera zoom (distance variation)"""
+    out_dir=os.path.join(root_path,dataset_name,)
+    os.makedirs(out_dir,exist_ok=True)
+    bg=0.0
+    num_keyframes=120
+    radius_range = args.zoom_range if hasattr(args, 'zoom_range') else 0.3
+    video_ids=list(dataset.videos_info.keys())
+
+    for vidx,video_id in enumerate(video_ids):
+        print(f'{video_id} [{vidx+1}/{len(video_ids)}]')
+        out_videoid_dir=os.path.join(out_dir,f"{video_id}")
+        out_render_path=os.path.join(out_videoid_dir,'render')
+        os.makedirs(out_render_path,exist_ok=True)
+        source_info=dataset._load_source_info(video_id)
+
+        vertex_gs_dict,up_point_gs_dict,_ = infer_model(source_info, )
+        novel_cam_params=generate_novel_view_poses_with_zoom(
+            source_info,
+            image_size=dataset.image_size,
+            tanfov=dataset.tanfov,
+            num_keyframes=num_keyframes,
+            radius_range=radius_range
+        )
+        ubody_gaussians=Ubody_Gaussian(meta_cfg.MODEL,vertex_gs_dict,up_point_gs_dict,pruning=True)
+        ubody_gaussians.init_ehm(infer_model.ehm)
+        ubody_gaussians.eval()
+
+        frames=dataset.videos_info[video_id]['frames_keys']
+        rendering_imgs=[]
+        for idx,frame in tqdm(enumerate(frames)) :
+
+            target_info=dataset._load_target_info(video_id,frame)
+            deform_gaussian_assets=ubody_gaussians(target_info)
+            render_cam_param=novel_cam_params[idx%num_keyframes]
+            render_results=render_model(deform_gaussian_assets,render_cam_param,bg=bg)
+
+            render_image=render_results['renders'][0]
+            gt_mask=target_info['mask'][0]
+            torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
+            rendering_imgs.append(to8b(render_image.detach().cpu().numpy()))
+
+        rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
+        imageio.mimwrite(os.path.join(out_videoid_dir, f'{video_id}_dynamic_novel_views_with_zoom_video.mp4'), rendering_imgs, fps=30, quality=8)
+
+
+def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:GaussianRenderer,dataset:TrackedData_infer,dataset_name:str,root_path:str,args):
+    """Render novel views with fixed camera angle and zoom for data augmentation"""
+    out_dir=os.path.join(root_path,dataset_name,)
+    os.makedirs(out_dir,exist_ok=True)
+    bg=0.0
+    num_keyframes=120
+
+    # Get fixed viewpoint parameters
+    fixed_yaw = args.fixed_yaw if hasattr(args, 'fixed_yaw') else 0.0
+    fixed_pitch = args.fixed_pitch if hasattr(args, 'fixed_pitch') else 0.0
+    fixed_zoom = args.fixed_zoom if hasattr(args, 'fixed_zoom') else 1.0
+
+    video_ids=list(dataset.videos_info.keys())
+
+    for vidx,video_id in enumerate(video_ids):
+        print(f'{video_id} [{vidx+1}/{len(video_ids)}]')
+        out_videoid_dir=os.path.join(out_dir,f"{video_id}")
+        out_render_path=os.path.join(out_videoid_dir,'render')
+        os.makedirs(out_render_path,exist_ok=True)
+        source_info=dataset._load_source_info(video_id)
+
+        vertex_gs_dict,up_point_gs_dict,_ = infer_model(source_info, )
+        novel_cam_params=generate_novel_view_poses_fixed(
+            source_info,
+            image_size=dataset.image_size,
+            tanfov=dataset.tanfov,
+            num_keyframes=num_keyframes,
+            fixed_yaw=fixed_yaw,
+            fixed_pitch=fixed_pitch,
+            fixed_zoom=fixed_zoom
+        )
+        ubody_gaussians=Ubody_Gaussian(meta_cfg.MODEL,vertex_gs_dict,up_point_gs_dict,pruning=True)
+        ubody_gaussians.init_ehm(infer_model.ehm)
+        ubody_gaussians.eval()
+
+        frames=dataset.videos_info[video_id]['frames_keys']
+        rendering_imgs=[]
+        for idx,frame in tqdm(enumerate(frames)) :
+
+            target_info=dataset._load_target_info(video_id,frame)
+            deform_gaussian_assets=ubody_gaussians(target_info)
+            render_cam_param=novel_cam_params[idx%num_keyframes]
+            render_results=render_model(deform_gaussian_assets,render_cam_param,bg=bg)
+
+            render_image=render_results['renders'][0]
+            gt_mask=target_info['mask'][0]
+            torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
+            rendering_imgs.append(to8b(render_image.detach().cpu().numpy()))
+
+        rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
+        imageio.mimwrite(os.path.join(out_videoid_dir, f'{video_id}_fixed_viewpoint_video.mp4'), rendering_imgs, fps=30, quality=8)
+
+
 def test(args,config_name, base_model, devices,data_path,model_path,save_path,out_name='test'):
     if config_name is None:
         model_config_path=os.path.join(f'{model_path}', f'config.yaml')
@@ -267,7 +366,13 @@ def test(args,config_name, base_model, devices,data_path,model_path,save_path,ou
         if args.render_static_novel_views:
             print('Rendering static novel views')
             render_static_novel_views(meta_cfg,infer_model,render_model,test_dataset,f'{out_name}_sta_novel_views',save_path,args)
-            
+        if args.render_dynamic_novel_views_with_zoom:
+            print('Rendering dynamic novel views with zoom')
+            render_novel_views_with_zoom(meta_cfg,infer_model,render_model,test_dataset,f'{out_name}_dyn_novel_views_zoom',save_path,args)
+        if args.render_fixed_viewpoint:
+            print('Rendering fixed viewpoint for data augmentation')
+            render_novel_views_fixed(meta_cfg,infer_model,render_model,test_dataset,f'{out_name}_fixed_viewpoint',save_path,args)
+
         if args.render_cross_act:
             print('Rendering cross-reenactment')
             meta_cfg['DATASET']['data_path']=args.source_data_path
@@ -293,7 +398,15 @@ if __name__ == "__main__":
     parser.add_argument('--render_dynamic_novel_views', action='store_true', default=False)
     parser.add_argument('--render_static_novel_views', action='store_true', default=False)
     parser.add_argument('--render_snovel_idx', nargs='+', type=int, default=[0])
-    
+    parser.add_argument('--render_dynamic_novel_views_with_zoom', action='store_true', default=False, help='Render dynamic novel views with camera zoom (distance variation)')
+    parser.add_argument('--zoom_range', type=float, default=0.3, help='Camera distance variation range (default: 0.3, meaning 0.7x to 1.3x of base radius)')
+
+    parser.add_argument('--render_fixed_viewpoint', action='store_true', default=False, help='Render with fixed camera viewpoint for data augmentation')
+    parser.add_argument('--fixed_yaw', type=float, default=0.0, help='Fixed horizontal rotation offset in radians (default: 0.0). Example: 0.3 for ~17° right, -0.3 for ~17° left')
+    parser.add_argument('--fixed_pitch', type=float, default=0.0, help='Fixed vertical rotation offset in radians (default: 0.0). Example: 0.2 for ~11° down, -0.2 for ~11° up')
+    parser.add_argument('--fixed_zoom', type=float, default=1.0, help='Fixed zoom scale multiplier (default: 1.0). Example: 1.3 for 30%% further, 0.7 for 30%% closer')
+
+
     parser.add_argument('--render_cross_act', action='store_true', default=False)
     parser.add_argument('--keep_source_cam', action='store_true', default=False)
     parser.add_argument('--source_data_path', type=str, default=None,help='source info for cross_reenactment')

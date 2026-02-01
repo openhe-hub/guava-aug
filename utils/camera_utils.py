@@ -56,7 +56,7 @@ class LookAtPoseSampler:
         camera_origins[:, 1:2] = radius*torch.cos(phi)
         forward_vectors = normalize_vecs(lookat_position - camera_origins)
         c2w=create_cam2world_matrix(forward_vectors, camera_origins)
-        
+
         w2c=torch.linalg.inv(c2w).squeeze(0)@torch.tensor([[1 ,0 ,0 ,0 ],#
                     [0 ,-1,0 ,0 ],
                     [0 ,0 ,-1,0 ],
@@ -64,10 +64,10 @@ class LookAtPoseSampler:
         R = torch.transpose(w2c[:3,:3],0,1).cpu().numpy()
         T= w2c[:3, 3].cpu().numpy()
         c2w=torch.linalg.inv(w2c)
-        
+
 
         return w2c,c2w
-    
+
 
 def generate_novel_view_poses(tracking_info,image_size=512,tanfov=1/24.0,pitch_range = 0.3,yaw_range = 0.35,num_keyframes=120):
     camera_center=tracking_info['c2w_cam'][0,:3,3]
@@ -77,10 +77,10 @@ def generate_novel_view_poses(tracking_info,image_size=512,tanfov=1/24.0,pitch_r
     FoVx=tanfov
     FoVy=tanfov
     radius=camera_center.square().sum().sqrt()
-    
+
     lookat_position=[0.0,0.75,0.0]
     print("Generate multi-view poses for rendering")
-    
+
     for frame_idx in tqdm(range(num_keyframes)):
         w2c_cam,c2w_cam=LookAtPoseSampler.sample(
             horizontal_mean=3.14 / 2 + yaw_range * np.sin(2 * 3.14 * frame_idx / (num_keyframes)),
@@ -93,5 +93,123 @@ def generate_novel_view_poses(tracking_info,image_size=512,tanfov=1/24.0,pitch_r
                                 'image_height':torch.tensor([image_size],device=device),'image_width':torch.tensor([image_size],device=device),
                                 'camera_center':c2w_cam[:3,3].unsqueeze(0)
                                     })
-        
+
+    return circle_cam_params
+
+
+def generate_novel_view_poses_with_zoom(tracking_info,image_size=512,tanfov=1/24.0,pitch_range = 0.3,yaw_range = 0.35,radius_range = 0.3,num_keyframes=120):
+    """
+    Generate novel view poses with camera zoom (distance variation).
+
+    Args:
+        tracking_info: Tracking information containing camera parameters
+        image_size: Output image size (default: 512)
+        tanfov: Tangent of field of view (default: 1/24.0)
+        pitch_range: Vertical rotation range in radians (default: 0.3)
+        yaw_range: Horizontal rotation range in radians (default: 0.35)
+        radius_range: Camera distance variation range as a ratio of base radius (default: 0.3)
+                      e.g., 0.3 means camera moves from 0.7*radius to 1.3*radius
+        num_keyframes: Number of keyframes to generate (default: 120)
+
+    Returns:
+        List of camera parameters for each keyframe
+    """
+    camera_center=tracking_info['c2w_cam'][0,:3,3]
+    device=tracking_info['c2w_cam'].device
+    circle_cam_params=[]
+    result_cam_params=[]
+    FoVx=tanfov
+    FoVy=tanfov
+    base_radius=camera_center.square().sum().sqrt()
+
+    lookat_position=[0.0,0.75,0.0]
+    print(f"Generate multi-view poses with zoom (radius range: {1-radius_range:.2f}x to {1+radius_range:.2f}x)")
+
+    for frame_idx in tqdm(range(num_keyframes)):
+        # Add radius variation with sine wave for smooth zoom in/out
+        radius_multiplier = 1.0 + radius_range * np.sin(2 * 3.14 * frame_idx / num_keyframes)
+        current_radius = base_radius * radius_multiplier
+
+        w2c_cam,c2w_cam=LookAtPoseSampler.sample(
+            horizontal_mean=3.14 / 2 + yaw_range * np.sin(2 * 3.14 * frame_idx / (num_keyframes)),
+            vertical_mean=3.14 / 2 - 0.05 + pitch_range * np.cos(2 * 3.14 * frame_idx / (num_keyframes)),
+            lookat_position=torch.Tensor(lookat_position).to(device),FoVx=FoVx,FoVy=FoVy ,radius=current_radius, device=device)
+        view_matrix,full_proj_matrix=get_full_proj_matrix(w2c_cam,tanfov)
+        circle_cam_params.append({
+                                "world_view_transform":view_matrix.unsqueeze(0),"full_proj_transform":full_proj_matrix.unsqueeze(0),
+                                'tanfovx':torch.tensor([FoVx],device=device),'tanfovy':torch.tensor([FoVy],device=device),
+                                'image_height':torch.tensor([image_size],device=device),'image_width':torch.tensor([image_size],device=device),
+                                'camera_center':c2w_cam[:3,3].unsqueeze(0)
+                                    })
+
+    return circle_cam_params
+
+
+def generate_novel_view_poses_fixed(tracking_info, image_size=512, tanfov=1/24.0,
+                                    fixed_yaw=0.0, fixed_pitch=0.0, fixed_zoom=1.0, num_keyframes=120):
+    """
+    Generate novel view poses with fixed camera angle and zoom for all frames.
+    This is useful for data augmentation - render the same motion sequence from different fixed viewpoints.
+
+    Args:
+        tracking_info: Tracking information containing camera parameters
+        image_size: Output image size (default: 512)
+        tanfov: Tangent of field of view (default: 1/24.0)
+        fixed_yaw: Fixed horizontal rotation offset in radians (default: 0.0)
+                   Positive values rotate right, negative rotate left
+                   Example: 0.3 (~17°), -0.3 (~-17°)
+        fixed_pitch: Fixed vertical rotation offset in radians (default: 0.0)
+                     Positive values look down, negative look up
+                     Example: 0.2 (~11°), -0.2 (~-11°)
+        fixed_zoom: Fixed zoom scale multiplier (default: 1.0)
+                    Values > 1.0 zoom out (further away), < 1.0 zoom in (closer)
+                    Example: 1.3 (30% further), 0.7 (30% closer)
+        num_keyframes: Number of keyframes to generate (default: 120)
+
+    Returns:
+        List of camera parameters for each keyframe (all with the same viewpoint)
+    """
+    camera_center = tracking_info['c2w_cam'][0, :3, 3]
+    device = tracking_info['c2w_cam'].device
+    circle_cam_params = []
+    FoVx = tanfov
+    FoVy = tanfov
+    base_radius = camera_center.square().sum().sqrt()
+
+    # Apply fixed zoom to radius
+    fixed_radius = base_radius * fixed_zoom
+
+    lookat_position = [0.0, 0.75, 0.0]
+
+    # Fixed camera angles
+    horizontal_angle = 3.14 / 2 + fixed_yaw
+    vertical_angle = 3.14 / 2 - 0.05 + fixed_pitch
+
+    print(f"Generate fixed viewpoint poses:")
+    print(f"  Yaw offset: {fixed_yaw:.3f} rad ({np.rad2deg(fixed_yaw):.1f}°)")
+    print(f"  Pitch offset: {fixed_pitch:.3f} rad ({np.rad2deg(fixed_pitch):.1f}°)")
+    print(f"  Zoom scale: {fixed_zoom:.2f}x (radius: {fixed_radius:.3f})")
+
+    for frame_idx in tqdm(range(num_keyframes)):
+        # Use the same camera position for all frames
+        w2c_cam, c2w_cam = LookAtPoseSampler.sample(
+            horizontal_mean=horizontal_angle,
+            vertical_mean=vertical_angle,
+            lookat_position=torch.Tensor(lookat_position).to(device),
+            FoVx=FoVx,
+            FoVy=FoVy,
+            radius=fixed_radius,
+            device=device
+        )
+        view_matrix, full_proj_matrix = get_full_proj_matrix(w2c_cam, tanfov)
+        circle_cam_params.append({
+            "world_view_transform": view_matrix.unsqueeze(0),
+            "full_proj_transform": full_proj_matrix.unsqueeze(0),
+            'tanfovx': torch.tensor([FoVx], device=device),
+            'tanfovy': torch.tensor([FoVy], device=device),
+            'image_height': torch.tensor([image_size], device=device),
+            'image_width': torch.tensor([image_size], device=device),
+            'camera_center': c2w_cam[:3, 3].unsqueeze(0)
+        })
+
     return circle_cam_params
