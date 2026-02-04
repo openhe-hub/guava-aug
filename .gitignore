@@ -1,0 +1,22 @@
+# Model weights and assets
+assets/FLAME/FLAME2020/
+assets/GUAVA/checkpoints/
+assets/SMPLX/SMPLX_NEUTRAL_2020.npz
+assets/SMPLX/flame_generic_model.pkl
+assets/example/
+assets/phoenix14t/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.egg-info/
+build/
+
+# Outputs
+outputs/
+
+# IDE
+.claude/

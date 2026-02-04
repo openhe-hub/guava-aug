@@ -266,7 +266,7 @@ def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_
     """Render novel views with fixed camera angle and zoom for data augmentation"""
     out_dir=os.path.join(root_path,dataset_name,)
     os.makedirs(out_dir,exist_ok=True)
-    bg=0.0
+    bg = args.bg_color if hasattr(args, 'bg_color') else 0.0
     num_keyframes=120
 
     # Get fixed viewpoint parameters
@@ -304,7 +304,9 @@ def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_
             target_info=dataset._load_target_info(video_id,frame)
             deform_gaussian_assets=ubody_gaussians(target_info)
             render_cam_param=novel_cam_params[idx%num_keyframes]
-            render_results=render_model(deform_gaussian_assets,render_cam_param,bg=bg)
+            # Force white background
+            bg_value = 1.0 if bg > 0.5 else 0.0
+            render_results=render_model(deform_gaussian_assets,render_cam_param,bg=bg_value)
 
             render_image=render_results['renders'][0]
             gt_mask=target_info['mask'][0]
@@ -405,6 +407,7 @@ if __name__ == "__main__":
     parser.add_argument('--fixed_yaw', type=float, default=0.0, help='Fixed horizontal rotation offset in radians (default: 0.0). Example: 0.3 for ~17° right, -0.3 for ~17° left')
     parser.add_argument('--fixed_pitch', type=float, default=0.0, help='Fixed vertical rotation offset in radians (default: 0.0). Example: 0.2 for ~11° down, -0.2 for ~11° up')
     parser.add_argument('--fixed_zoom', type=float, default=1.0, help='Fixed zoom scale multiplier (default: 1.0). Example: 1.3 for 30%% further, 0.7 for 30%% closer')
+    parser.add_argument('--bg_color', type=float, default=0.0, help='Background color value (default: 0.0 for black, 1.0 for white)')
 
 
     parser.add_argument('--render_cross_act', action='store_true', default=False)

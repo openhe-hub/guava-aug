@@ -32,7 +32,11 @@ class GaussianRenderer(L.LightningModule):
         cov3D_precomp = None
         
         rendered_images,radiis,depth_images,alpha_images=[],[],[],[]
-        bg=torch.ones((batch_size,features_color.shape[-1]),dtype=torch.float32,device=device)*bg
+        bg_value = 0.0 if bg is None else float(bg)
+        # Keep rasterizer background at zero to preserve trained feature distribution
+        bg_tensor = torch.zeros((batch_size, features_color.shape[-1]), dtype=torch.float32, device=device)
+        compute_alpha = bg_value != 0.0
+        alpha_features = torch.ones_like(features_color) if compute_alpha else None
         
         for bi in range(batch_size):
             raster_settings = GaussianRasterizationSettings(
@@ -40,7 +44,7 @@ class GaussianRenderer(L.LightningModule):
                 image_width=int(cam_params['image_width'][bi]),
                 tanfovx=float(cam_params['tanfovx'][bi]),
                 tanfovy=float(cam_params['tanfovy'][bi]),
-                bg=bg[bi],
+                bg=bg_tensor[bi],
                 scale_modifier=scaling_modifier,
                 viewmatrix=cam_params['world_view_transform'][bi],
                 projmatrix=cam_params['full_proj_transform'][bi],
@@ -61,16 +65,32 @@ class GaussianRenderer(L.LightningModule):
                     scales = scales[bi],
                     rotations = rotations[bi],
                     cov3D_precomp = cov3D_precomp)
-                
+
             rendered_images.append(rendered_image)
             radiis.append(radii)
             depth_images.append(depth_image)
+            if compute_alpha:
+                alpha_render, _, _ = rasterizer(
+                    means3D = mean_3d[bi],
+                    means2D = mean_2d[bi],
+                    shs = None,
+                    colors_precomp = alpha_features[bi],
+                    opacities = opacity[bi],
+                    scales = scales[bi],
+                    rotations = rotations[bi],
+                    cov3D_precomp = cov3D_precomp)
+                alpha_images.append(alpha_render[:1])
             
         
         rendered_images = torch.stack(rendered_images, dim=0)
         raw_images = rendered_images[:,:3]
         
         refine_images = self.nerual_refiner(rendered_images)
+        if compute_alpha:
+            alpha_images = torch.stack(alpha_images, dim=0).clamp_(0.0, 1.0)
+            bg_rgb = torch.full_like(refine_images, bg_value)
+            refine_images = refine_images * alpha_images + bg_rgb * (1.0 - alpha_images)
+            raw_images = raw_images * alpha_images + bg_rgb * (1.0 - alpha_images)
 
         radiis = torch.stack(radiis, dim=0)
         depth_images = torch.stack(depth_images, dim=0)
