@@ -6,7 +6,9 @@ import subprocess
 import random
 import json
 import os
+import sys
 import argparse
+import hashlib
 from pathlib import Path
 
 
@@ -74,10 +76,9 @@ def run_guava_augmentation(video_name, tracked_path, output_dir, difficulty, see
     # Generate random parameters
     yaw, pitch, zoom = generate_random_params(difficulty, seed)
 
-    # Construct GUAVA command using conda environment
-    conda_python = '/home/nyuair/anaconda3/envs/GUAVA/bin/python'
+    # Construct GUAVA command using current python (from activated conda env)
     cmd = [
-        conda_python, 'main/test.py',
+        sys.executable, 'main/test.py',
         '-d', str(device),
         '-m', model_path,
         '-s', output_dir,
@@ -87,7 +88,7 @@ def run_guava_augmentation(video_name, tracked_path, output_dir, difficulty, see
         '--fixed_yaw', str(yaw),
         '--fixed_pitch', str(pitch),
         '--fixed_zoom', str(zoom),
-        '--bg_color', '1.0'  # White background
+        '--skip_frame_png',
     ]
 
     print(f"\n{'='*80}")
@@ -133,7 +134,7 @@ def run_guava_augmentation(video_name, tracked_path, output_dir, difficulty, see
 
 def batch_augmentation(video_list, tracked_root, output_root, difficulties=['easy', 'medium', 'hard'],
                       base_seed=42, guava_root='/home/nyuair/zhewen/GUAVA',
-                      model_path='assets/GUAVA', device='0'):
+                      model_path='assets/GUAVA', device='0', part_id=None):
     """
     Run batch augmentation for multiple videos and difficulties.
 
@@ -156,11 +157,18 @@ def batch_augmentation(video_list, tracked_root, output_root, difficulties=['eas
         all_params[video_name] = {}
 
         for diff_idx, difficulty in enumerate(difficulties):
-            # Generate unique seed for reproducibility
-            seed = base_seed + idx * len(difficulties) + diff_idx
+            # Generate unique seed using deterministic hash of video name
+            # This ensures the same video always gets the same seed regardless of
+            # which partition/shard it appears in
+            video_hash = int(hashlib.md5(video_name.encode()).hexdigest()[:8], 16)
+            seed = base_seed + (video_hash % 100000) * len(difficulties) + diff_idx
 
             # Paths
+            # Compatible with both tracked_root/{video} and tracked_root/{video}/{video}
             tracked_path = os.path.join(tracked_root, video_name)
+            nested_tracked_path = os.path.join(tracked_root, video_name, video_name)
+            if os.path.exists(os.path.join(nested_tracked_path, 'videos_info.json')):
+                tracked_path = nested_tracked_path
             output_dir = os.path.join(output_root, difficulty, video_name)
 
             # Check if video already exists
@@ -184,8 +192,12 @@ def batch_augmentation(video_list, tracked_root, output_root, difficulties=['eas
 
             all_params[video_name][difficulty] = params
 
-    # Save all parameters to JSON
-    params_file = os.path.join(output_root, 'augmentation_params.json')
+    # Save all parameters to JSON (per-partition to avoid overwrites in array jobs)
+    if part_id is not None:
+        params_filename = f'augmentation_params_part_{part_id}.json'
+    else:
+        params_filename = 'augmentation_params.json'
+    params_file = os.path.join(output_root, params_filename)
     os.makedirs(output_root, exist_ok=True)
     with open(params_file, 'w') as f:
         json.dump(all_params, f, indent=2)
@@ -203,8 +215,10 @@ def batch_augmentation(video_list, tracked_root, output_root, difficulties=['eas
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run GUAVA view augmentation')
-    parser.add_argument('--video_list', type=str, nargs='+', required=True,
+    parser.add_argument('--video_list', type=str, nargs='+', required=False,
                         help='List of video names (without extension)')
+    parser.add_argument('--video_list_file', type=str, default=None,
+                        help='File containing video names (one per line)')
     parser.add_argument('--tracked_root', type=str, required=True,
                         help='Root directory containing EHM-Tracker outputs')
     parser.add_argument('--output_root', type=str, required=True,
@@ -221,16 +235,28 @@ if __name__ == '__main__':
                         help='Path to GUAVA model checkpoint')
     parser.add_argument('--device', type=str, default='0',
                         help='GPU device ID')
+    parser.add_argument('--part_id', type=int, default=None,
+                        help='Partition ID (e.g. SLURM_ARRAY_TASK_ID) for per-shard params file')
 
     args = parser.parse_args()
 
+    # Get video list from file or command line
+    if args.video_list_file:
+        with open(args.video_list_file, 'r') as f:
+            video_list = [line.strip() for line in f if line.strip()]
+    elif args.video_list:
+        video_list = args.video_list
+    else:
+        raise ValueError("Must provide either --video_list or --video_list_file")
+
     batch_augmentation(
-        args.video_list,
+        video_list,
         args.tracked_root,
         args.output_root,
         args.difficulties,
         args.base_seed,
         args.guava_root,
         args.model_path,
-        args.device
+        args.device,
+        args.part_id
     )

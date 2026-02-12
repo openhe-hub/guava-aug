@@ -27,6 +27,46 @@ def change_id_info(target_info,source_info):
     target_info['flame_coeffs']['shape_params']=source_info['flame_coeffs']['shape_params']
     return target_info
 
+def inpaint_person_region(gt_image, gt_mask, dilation_kernel=9, inpaint_radius=3):
+    """Fill the original person region in GT so novel-view compositing keeps a natural background."""
+    person_mask = gt_mask[:1].clamp(0.0, 1.0)
+    if dilation_kernel > 1:
+        pad = dilation_kernel // 2
+        person_mask = torch.nn.functional.max_pool2d(
+            person_mask[None], kernel_size=dilation_kernel, stride=1, padding=pad
+        )[0]
+    person_mask_bin = (person_mask[0] > 0.05)
+    if int(person_mask_bin.sum().item()) == 0:
+        return gt_image
+
+    work = gt_image.clone()
+    known = (~person_mask_bin).float()[None]
+    kernel = torch.ones((1, 1, 3, 3), device=gt_image.device, dtype=gt_image.dtype)
+    kernel_rgb = kernel.repeat(3, 1, 1, 1)
+
+    # Iteratively diffuse known neighborhood colors into the removed person area.
+    # This avoids external cv2/libGL dependency on cluster environments.
+    max_iters = max(32, inpaint_radius * 16)
+    for _ in range(max_iters):
+        if bool((known > 0.5).all()):
+            break
+        known_rgb = known.repeat(3, 1, 1)
+        num = torch.nn.functional.conv2d((work * known_rgb)[None], kernel_rgb, padding=1, groups=3)
+        den = torch.nn.functional.conv2d(known[None], kernel, padding=1)
+        fill = (den > 0) & (known[None] < 0.5)
+        if not bool(fill.any()):
+            break
+        fill_rgb = fill.repeat(1, 3, 1, 1)
+        val = num / (den + 1e-6)
+        work = torch.where(fill_rgb[0], val[0], work)
+        known = torch.where(fill[0], torch.ones_like(known), known)
+
+    # Fallback: if some pixels are still unknown, use a softened mask blend from original image.
+    if bool((known < 0.5).any()):
+        soft_bg = work * known.repeat(3, 1, 1) + gt_image * (1 - known.repeat(3, 1, 1))
+        work = torch.where(known.repeat(3, 1, 1) > 0.5, work, soft_bg)
+    return work
+
 def render_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:GaussianRenderer,dataset:TrackedData_infer,dataset_name:str,root_path:str,):
     out_dir=os.path.join(root_path,dataset_name,) 
     os.makedirs(out_dir,exist_ok=True)
@@ -94,15 +134,21 @@ def render_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:Gaussian
             json.dump(speed_info, f)
 
 def render_cross_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:GaussianRenderer,source_dataset:TrackedData_infer,target_dataset:TrackedData_infer,dataset_name:str,root_path:str,args):
-    out_dir=os.path.join(root_path,dataset_name,) 
+    out_dir=os.path.join(root_path,dataset_name,)
     os.makedirs(out_dir,exist_ok=True)
-    bg=0.0
-    
+
+    # Get view augmentation parameters
+    use_aug = args.cross_aug if hasattr(args, 'cross_aug') else False
+    fixed_yaw = args.fixed_yaw if hasattr(args, 'fixed_yaw') else 0.0
+    fixed_pitch = args.fixed_pitch if hasattr(args, 'fixed_pitch') else 0.0
+    fixed_zoom = args.fixed_zoom if hasattr(args, 'fixed_zoom') else 1.0
+    bg = args.bg_color if hasattr(args, 'bg_color') else 0.0
+
     s_video_ids=list(source_dataset.videos_info.keys())
     t_video_ids=list(target_dataset.videos_info.keys())
     for s_vidx,s_video_id in enumerate(s_video_ids):
         source_info=source_dataset._load_source_info(s_video_id,)
-        source_info['render_cam_params']=source_dataset._load_target_info(s_video_id,source_dataset.videos_info[s_video_id]['frames_keys'][0])
+        source_info['render_cam_params']=source_dataset._load_target_info(s_video_id,source_dataset.videos_info[s_video_id]['frames_keys'][0])['render_cam_params']
         vertex_gs_dict,up_point_gs_dict,_ = infer_model(source_info, )
         ubody_gaussians=Ubody_Gaussian(meta_cfg.MODEL,vertex_gs_dict,up_point_gs_dict,pruning=True)
         ubody_gaussians.init_ehm(infer_model.ehm)
@@ -117,24 +163,41 @@ def render_cross_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:Ga
             os.makedirs(out_render_path,exist_ok=True)
             torchvision.utils.save_image(source_info['image'], os.path.join(out_videoid_dir,'source_image.png'))
             frames=target_dataset.videos_info[t_video_id]['frames_keys']
-            
+
             test_num=target_dataset.testing_split[t_video_id]
+
+            # Generate novel camera params if augmentation is enabled
+            if use_aug:
+                novel_cam_params = generate_novel_view_poses_fixed(
+                    source_info,
+                    image_size=source_dataset.image_size,
+                    tanfov=source_dataset.tanfov,
+                    num_keyframes=test_num,
+                    fixed_yaw=fixed_yaw,
+                    fixed_pitch=fixed_pitch,
+                    fixed_zoom=fixed_zoom
+                )
+
             rendering_imgs=[]
             for idx,frame in tqdm(enumerate(frames[-test_num:])) :
                 target_info=target_dataset._load_target_info(t_video_id,frame)
                 target_info=change_id_info(target_info,source_info)
                 deform_gaussian_assets=ubody_gaussians(target_info)
-                if args.keep_source_cam:
+
+                if use_aug:
+                    render_cam_parms = novel_cam_params[idx % len(novel_cam_params)]
+                elif args.keep_source_cam:
                     render_cam_parms=source_info['render_cam_params']
-                else: render_cam_parms=target_info['render_cam_params']
-                
+                else:
+                    render_cam_parms=target_info['render_cam_params']
+
                 render_results=render_model(deform_gaussian_assets,render_cam_parms,bg=bg)
- 
+
                 render_image=render_results['renders'][0]
                 gt_mask=target_info['mask'][0]
                 torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
                 rendering_imgs.append(to8b(render_image.detach().cpu().numpy()))
-                
+
             rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
             imageio.mimwrite(os.path.join(out_videoid_dir, f'{s_video_id}_{t_video_id}_video.mp4'), rendering_imgs, fps=30, quality=8)
             
@@ -266,7 +329,6 @@ def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_
     """Render novel views with fixed camera angle and zoom for data augmentation"""
     out_dir=os.path.join(root_path,dataset_name,)
     os.makedirs(out_dir,exist_ok=True)
-    bg = args.bg_color if hasattr(args, 'bg_color') else 0.0
     num_keyframes=120
 
     # Get fixed viewpoint parameters
@@ -276,11 +338,15 @@ def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_
 
     video_ids=list(dataset.videos_info.keys())
 
+    skip_png = args.skip_frame_png if hasattr(args, 'skip_frame_png') else False
+
     for vidx,video_id in enumerate(video_ids):
         print(f'{video_id} [{vidx+1}/{len(video_ids)}]')
         out_videoid_dir=os.path.join(out_dir,f"{video_id}")
-        out_render_path=os.path.join(out_videoid_dir,'render')
-        os.makedirs(out_render_path,exist_ok=True)
+        if not skip_png:
+            out_render_path=os.path.join(out_videoid_dir,'render')
+            os.makedirs(out_render_path,exist_ok=True)
+        os.makedirs(out_videoid_dir,exist_ok=True)
         source_info=dataset._load_source_info(video_id)
 
         vertex_gs_dict,up_point_gs_dict,_ = infer_model(source_info, )
@@ -304,14 +370,23 @@ def render_novel_views_fixed(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_
             target_info=dataset._load_target_info(video_id,frame)
             deform_gaussian_assets=ubody_gaussians(target_info)
             render_cam_param=novel_cam_params[idx%num_keyframes]
-            # Force white background
-            bg_value = 1.0 if bg > 0.5 else 0.0
-            render_results=render_model(deform_gaussian_assets,render_cam_param,bg=bg_value)
+            render_results=render_model(
+                deform_gaussian_assets,
+                render_cam_param,
+                bg=0.0,
+                compute_alpha=True,
+                composite_bg=False
+            )
 
             render_image=render_results['renders'][0]
+            gt_image=target_info['image'][0]
             gt_mask=target_info['mask'][0]
-            torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
-            rendering_imgs.append(to8b(render_image.detach().cpu().numpy()))
+            gt_background=inpaint_person_region(gt_image, gt_mask)
+            render_alpha=render_results['alpha_images'][0].clamp(0.0, 1.0)
+            final_image=render_image * render_alpha + gt_background * (1 - render_alpha)
+            if not skip_png:
+                torchvision.utils.save_image(final_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
+            rendering_imgs.append(to8b(final_image.detach().cpu().numpy()))
 
         rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
         imageio.mimwrite(os.path.join(out_videoid_dir, f'{video_id}_fixed_viewpoint_video.mp4'), rendering_imgs, fps=30, quality=8)
@@ -408,11 +483,13 @@ if __name__ == "__main__":
     parser.add_argument('--fixed_pitch', type=float, default=0.0, help='Fixed vertical rotation offset in radians (default: 0.0). Example: 0.2 for ~11° down, -0.2 for ~11° up')
     parser.add_argument('--fixed_zoom', type=float, default=1.0, help='Fixed zoom scale multiplier (default: 1.0). Example: 1.3 for 30%% further, 0.7 for 30%% closer')
     parser.add_argument('--bg_color', type=float, default=0.0, help='Background color value (default: 0.0 for black, 1.0 for white)')
-
+    parser.add_argument('--skip_frame_png', action='store_true', default=False, help='Skip writing per-frame PNG files (only output MP4 video)')
 
     parser.add_argument('--render_cross_act', action='store_true', default=False)
     parser.add_argument('--keep_source_cam', action='store_true', default=False)
     parser.add_argument('--source_data_path', type=str, default=None,help='source info for cross_reenactment')
+    parser.add_argument('--cross_aug', action='store_true', default=False,
+                        help='Enable view augmentation for cross-reenactment (uses fixed_yaw, fixed_pitch, fixed_zoom)')
     
     args = parser.parse_args()
     args.test_full = not args.non_test_full
