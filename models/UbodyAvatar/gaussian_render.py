@@ -16,7 +16,7 @@ class GaussianRenderer(L.LightningModule):
     def forward(self,*args, **kwargs):
         return self.forward_nueral_refine(*args, **kwargs)
     
-    def forward_nueral_refine(self, gaussian_assets, cam_params, bg=None,scaling_modifier=1.0,antialiasing=False):
+    def forward_nueral_refine(self, gaussian_assets, cam_params, bg=None,scaling_modifier=1.0,antialiasing=False,compute_alpha=None,composite_bg=True):
         
         mean_3d = gaussian_assets['xyz']
         opacity = gaussian_assets['opacity']
@@ -35,7 +35,8 @@ class GaussianRenderer(L.LightningModule):
         bg_value = 0.0 if bg is None else float(bg)
         # Keep rasterizer background at zero to preserve trained feature distribution
         bg_tensor = torch.zeros((batch_size, features_color.shape[-1]), dtype=torch.float32, device=device)
-        compute_alpha = bg_value != 0.0
+        if compute_alpha is None:
+            compute_alpha = bg_value != 0.0
         alpha_features = torch.ones_like(features_color) if compute_alpha else None
         
         for bi in range(batch_size):
@@ -86,11 +87,14 @@ class GaussianRenderer(L.LightningModule):
         raw_images = rendered_images[:,:3]
         
         refine_images = self.nerual_refiner(rendered_images)
+        alpha_output = rendered_images[:,3:4].clamp(0.0, 1.0)
         if compute_alpha:
             alpha_images = torch.stack(alpha_images, dim=0).clamp_(0.0, 1.0)
-            bg_rgb = torch.full_like(refine_images, bg_value)
-            refine_images = refine_images * alpha_images + bg_rgb * (1.0 - alpha_images)
-            raw_images = raw_images * alpha_images + bg_rgb * (1.0 - alpha_images)
+            alpha_output = alpha_images
+            if composite_bg:
+                bg_rgb = torch.full_like(refine_images, bg_value)
+                refine_images = refine_images * alpha_images + bg_rgb * (1.0 - alpha_images)
+                raw_images = raw_images * alpha_images + bg_rgb * (1.0 - alpha_images)
 
         radiis = torch.stack(radiis, dim=0)
         depth_images = torch.stack(depth_images, dim=0)
@@ -100,6 +104,7 @@ class GaussianRenderer(L.LightningModule):
             "viewspace_points": mean_2d,
             "radiis": radiis,
             "depths" : depth_images,
+            "alpha_images": alpha_output,
             'extra_renders':rendered_images[:,3:4],
             
             }
