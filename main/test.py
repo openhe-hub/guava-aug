@@ -143,6 +143,7 @@ def render_cross_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:Ga
     fixed_pitch = args.fixed_pitch if hasattr(args, 'fixed_pitch') else 0.0
     fixed_zoom = args.fixed_zoom if hasattr(args, 'fixed_zoom') else 1.0
     bg = args.bg_color if hasattr(args, 'bg_color') else 0.0
+    skip_png = args.skip_frame_png if hasattr(args, 'skip_frame_png') else False
 
     s_video_ids=list(source_dataset.videos_info.keys())
     t_video_ids=list(target_dataset.videos_info.keys())
@@ -159,8 +160,10 @@ def render_cross_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:Ga
         for t_vidx,t_video_id in enumerate(t_video_ids):
             print(f'{t_video_id} [{t_vidx+1}/{len(t_video_ids)}]')
             out_videoid_dir=os.path.join(out_sub_dir,f'{s_video_id}_{t_video_id}')
-            out_render_path=os.path.join(out_videoid_dir,'render')
-            os.makedirs(out_render_path,exist_ok=True)
+            os.makedirs(out_videoid_dir,exist_ok=True)
+            if not skip_png:
+                out_render_path=os.path.join(out_videoid_dir,'render')
+                os.makedirs(out_render_path,exist_ok=True)
             torchvision.utils.save_image(source_info['image'], os.path.join(out_videoid_dir,'source_image.png'))
             frames=target_dataset.videos_info[t_video_id]['frames_keys']
 
@@ -195,7 +198,8 @@ def render_cross_set(meta_cfg,infer_model:Ubody_Gaussian_inferer,render_model:Ga
 
                 render_image=render_results['renders'][0]
                 gt_mask=target_info['mask'][0]
-                torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
+                if not skip_png:
+                    torchvision.utils.save_image(render_image, os.path.join(out_render_path, '{0:05d}'.format(idx) + ".png"))
                 rendering_imgs.append(to8b(render_image.detach().cpu().numpy()))
 
             rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
